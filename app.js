@@ -1,4 +1,4 @@
-const APP_VERSION = 'v0.1.4';
+const APP_VERSION = 'v0.1.5';
 const UNIT_SYSTEMS = Object.freeze({
   metric: 'metric',
   imperial: 'imperial'
@@ -182,6 +182,7 @@ async function fetchWeather() {
       'apparent_temperature',
       'dew_point_2m',
       'precipitation_probability',
+      'visibility',
       'wind_speed_10m',
       'wind_direction_10m'
     ].join(','),
@@ -234,6 +235,7 @@ function mergeHourlyData(weather, marine) {
       apparentTemperature: getIndexedValue(weather.hourly.apparent_temperature, index),
       dewPoint: getIndexedValue(weather.hourly.dew_point_2m, index),
       precipitationProbability: getIndexedValue(weather.hourly.precipitation_probability, index),
+      visibility: getIndexedValue(weather.hourly.visibility, index),
       windSpeed: getIndexedValue(weather.hourly.wind_speed_10m, index),
       windDirectionDeg: getIndexedValue(weather.hourly.wind_direction_10m, index)
     });
@@ -421,33 +423,79 @@ function renderTides(dayHours, dayKey) {
   `).join('');
 }
 
+function buildWhaleWatchingNote(dayHours, daytimeHours, dayKey) {
+  const morningHours = getWhaleWatchingHours(dayHours, daytimeHours, dayKey);
+  const afternoonHours = daytimeHours.filter(entry => entry.hour >= 13 && entry.hour < 18);
+
+  if (!morningHours.length) {
+    return 'Whale watching outlook unavailable right now.';
+  }
+
+  const month = getDateFromDayKey(dayKey).getUTCMonth();
+  const morningEvaluation = evaluateWhaleWatchingWindow(morningHours, month);
+  const afternoonEvaluation = afternoonHours.length
+    ? evaluateWhaleWatchingWindow(afternoonHours, month)
+    : null;
+  const windCutoffHour = getWhaleWatchingWindCutoffHour(daytimeHours);
+
+  if (
+    windCutoffHour !== null
+    && morningEvaluation.finalLevel >= 2
+  ) {
+    return formatTimeWindowWhaleWatchingSentence(
+      morningEvaluation.finalLevel,
+      month,
+      `before ${formatCompactHour(windCutoffHour)}`
+    );
+  }
+
+  if (
+    afternoonEvaluation
+    && morningEvaluation.finalLevel >= 2
+    && morningEvaluation.finalLevel > afternoonEvaluation.finalLevel
+  ) {
+    return formatTimeWindowWhaleWatchingSentence(morningEvaluation.finalLevel, month, 'before midday');
+  }
+
+  return formatWhaleWatchingSentence(
+    morningEvaluation.finalLevel,
+    morningEvaluation.seasonType,
+    morningEvaluation.reason
+  );
+}
+
 function buildNotes(dayHours, daytimeHours, dayKey) {
   const notes = [];
   const maxPrecip = getMaxBy(daytimeHours, 'precipitationProbability');
   const peakWind = getPeakWind(daytimeHours);
   const maxWave = getMaxWave(dayHours);
   const seaWindow = getCalmSeaWindow(daytimeHours);
+  const whaleWatchingNote = buildWhaleWatchingNote(dayHours, daytimeHours, dayKey);
 
   if (maxPrecip && maxPrecip.precipitationProbability >= 60) {
     notes.push({ priority: 1, text: `Rain most likely around ${formatHour(maxPrecip.time)}.` });
   } else if (maxPrecip && maxPrecip.precipitationProbability >= 35) {
-    notes.push({ priority: 3, text: `Passing showers are possible during the day.` });
+    notes.push({ priority: 3, text: 'Passing showers are possible during the day.' });
   }
 
   if (peakWind && peakWind.windSpeed >= 35) {
     notes.push({ priority: 2, text: `Windy stretch near ${formatHour(peakWind.time)} with gustier beach feel.` });
   } else if (peakWind && peakWind.windSpeed >= 24) {
-    notes.push({ priority: 4, text: `Breezy through the daytime window.` });
+    notes.push({ priority: 4, text: 'Breezy through the daytime window.' });
   }
 
   if (maxWave && maxWave.waveHeight >= 2.2) {
-    notes.push({ priority: 2, text: `Rougher sea state expected, especially on open south-facing shores.` });
+    notes.push({ priority: 2, text: 'Rougher sea state expected, especially on open south-facing shores.' });
   } else if (maxWave && maxWave.waveHeight >= 1.4) {
-    notes.push({ priority: 4, text: `Moderate surf most of the day.` });
+    notes.push({ priority: 4, text: 'Moderate surf most of the day.' });
   }
 
   if (seaWindow) {
     notes.push({ priority: 5, text: `Calmer sea window around ${formatHour(seaWindow.time)}.` });
+  }
+
+  if (whaleWatchingNote) {
+    notes.push({ priority: 3, text: whaleWatchingNote });
   }
 
   if (!notes.length) {
@@ -491,6 +539,238 @@ function getCalmSeaWindow(entries) {
   );
 
   return getNearestHour(calmCandidates, 9);
+}
+
+function getWhaleWatchingHours(dayHours, daytimeHours, dayKey) {
+  const morningHours = dayHours.filter(entry => entry.hour >= 6 && entry.hour < 13);
+  if (dayKey !== getCurrentDateKey() && morningHours.length) {
+    return morningHours;
+  }
+
+  if (dayKey === getCurrentDateKey()) {
+    const nowHour = getCurrentHourFraction();
+    const remainingMorning = morningHours.filter(entry => entry.hour >= Math.floor(nowHour));
+    if (remainingMorning.length) {
+      return remainingMorning;
+    }
+
+    const remainingDaytime = daytimeHours.filter(entry => entry.hour >= Math.floor(nowHour));
+    if (remainingDaytime.length) {
+      return remainingDaytime;
+    }
+  }
+
+  return morningHours.length ? morningHours : daytimeHours;
+}
+
+function getWhaleSeasonType(monthIndex) {
+  if (monthIndex >= 3 && monthIndex <= 5) return 'peak';
+  if (monthIndex >= 6 && monthIndex <= 9) return 'active';
+  return 'reduced';
+}
+
+function evaluateWhaleWatchingWindow(entries, monthIndex) {
+  const swellLevel = getSwellLevel(getMaxBy(entries.filter(entry => Number.isFinite(entry.waveHeight)), 'waveHeight')?.waveHeight);
+  const windDirectionEntry = getRepresentativeWindDirectionEntry(entries);
+  const directionModifier = getWindDirectionModifier(windDirectionEntry?.windDirectionDeg);
+  const windSpeedLevel = getWindSpeedLevel(getPeakWind(entries)?.windSpeed);
+  const visibilityLevelModifier = getVisibilityModifier(getBestVisibility(entries));
+  const rainModifier = getRainModifier(getMaxBy(entries, 'precipitationProbability')?.precipitationProbability);
+
+  const baseLevels = [swellLevel, windSpeedLevel].filter(value => value !== null);
+  let marineLevel = baseLevels.length ? Math.min(...baseLevels) : 2;
+  marineLevel = clampConditionLevel(marineLevel + directionModifier);
+
+  let finalLevel = marineLevel;
+  if (visibilityLevelModifier > 0) {
+    finalLevel = Math.min(finalLevel + 1, 2);
+  } else if (visibilityLevelModifier < 0) {
+    finalLevel -= 1;
+  }
+  finalLevel += rainModifier;
+  finalLevel = applySeasonModifier(finalLevel, marineLevel, monthIndex, {
+    swellLevel,
+    windSpeedLevel,
+    directionModifier
+  });
+  finalLevel = applySwellCap(finalLevel, swellLevel);
+
+  return {
+    finalLevel,
+    seasonType: getWhaleSeasonType(monthIndex),
+    reason: getWhaleWatchingReason({
+      swellLevel,
+      windDirectionDeg: windDirectionEntry?.windDirectionDeg,
+      windSpeedLevel,
+      visibilityModifier: visibilityLevelModifier,
+      rainModifier,
+      finalLevel
+    })
+  };
+}
+
+function getWhaleWatchingWindCutoffHour(entries) {
+  const thresholdMph = 17;
+
+  for (const entry of entries) {
+    if (!Number.isFinite(entry?.windSpeed)) continue;
+    const speedMph = entry.windSpeed * 0.621371;
+    if (speedMph >= thresholdMph) {
+      return entry.hour;
+    }
+  }
+
+  return null;
+}
+
+function getSwellLevel(value) {
+  if (!Number.isFinite(value)) return null;
+  if (value < 1.5) return 3;
+  if (value <= 2.5) return 2;
+  if (value <= 4) return 1;
+  return 0;
+}
+
+function getWindSpeedLevel(value) {
+  if (!Number.isFinite(value)) return null;
+  const speedMph = value * 0.621371;
+  if (speedMph < 10) return 3;
+  if (speedMph <= 16) return 2;
+  if (speedMph <= 22) return 1;
+  return 0;
+}
+
+function getWindDirectionModifier(directionDeg) {
+  if (!Number.isFinite(directionDeg)) return 0;
+
+  const direction = formatDirection(directionDeg);
+  if (['N', 'NE', 'E'].includes(direction)) return 1;
+  if (['NW', 'SE'].includes(direction)) return 0;
+  if (['S', 'SW', 'W'].includes(direction)) return -1;
+  return 0;
+}
+
+function getVisibilityModifier(entry) {
+  const visibilityKm = getVisibilityKm(entry?.visibility);
+  if (!Number.isFinite(visibilityKm)) return 0;
+  if (visibilityKm > 10) return 1;
+  if (visibilityKm < 5) return -1;
+  return 0;
+}
+
+function getRainModifier(value) {
+  return Number.isFinite(value) && value > 70 ? -1 : 0;
+}
+
+function getVisibilityKm(value) {
+  if (!Number.isFinite(value)) return null;
+  return value / 1000;
+}
+
+function getBestVisibility(entries) {
+  return entries.reduce((best, entry) => {
+    if (!Number.isFinite(entry?.visibility)) return best;
+    if (!best || entry.visibility > best.visibility) return entry;
+    return best;
+  }, null);
+}
+
+function getRepresentativeWindDirectionEntry(entries) {
+  const preferred = getNearestHour(entries.filter(entry => Number.isFinite(entry.windDirectionDeg)), 9);
+  return preferred || entries.find(entry => Number.isFinite(entry.windDirectionDeg)) || null;
+}
+
+function applySeasonModifier(level, marineLevel, monthIndex, context = {}) {
+  const season = getWhaleSeasonType(monthIndex);
+
+  if (
+    season === 'peak'
+    && marineLevel >= 2
+    && context.swellLevel === 3
+    && context.windSpeedLevel === 3
+    && context.directionModifier >= 0
+  ) {
+    return clampConditionLevel(level + 1);
+  }
+
+  if (season === 'reduced' && marineLevel < 3) {
+    return clampConditionLevel(level - 1);
+  }
+
+  return clampConditionLevel(level);
+}
+
+function applySwellCap(level, swellLevel) {
+  if (swellLevel === null) {
+    return clampConditionLevel(level);
+  }
+
+  return clampConditionLevel(Math.min(level, swellLevel));
+}
+
+function clampConditionLevel(value) {
+  return Math.max(0, Math.min(3, value));
+}
+
+function getWhaleWatchingReason({ swellLevel, windDirectionDeg, windSpeedLevel, visibilityModifier, rainModifier, finalLevel }) {
+  const direction = formatDirection(windDirectionDeg);
+
+  if (swellLevel === 0) return 'rough Atlantic swell';
+  if (visibilityModifier < 0) return 'limited visibility';
+  if (rainModifier < 0) return 'showery visibility';
+  if (['S', 'SW', 'W'].includes(direction)) return 'choppier south coast seas';
+  if (swellLevel === 1) return 'mixed Atlantic swell';
+  if (windSpeedLevel === 0) return 'windy south coast seas';
+  if (finalLevel >= 2 && ['N', 'NE', 'E'].includes(direction)) return 'smoother south coast seas';
+  if (finalLevel === 3) return 'calmer Atlantic seas';
+  return '';
+}
+
+function formatWhaleWatchingSentence(level, seasonType, reason) {
+  const labels = ['Poor', 'Fair', 'Good', 'Excellent'];
+  const lead = `${labels[level]} whale watching conditions`;
+
+  if (level === 0 && reason) {
+    return `${lead} with ${reason}.`;
+  }
+
+  if (seasonType === 'peak') {
+    if (level === 3) return `${lead} during peak whale season.`;
+    if (level >= 2) return `${lead} with strong seasonal activity.`;
+    return `${lead} despite peak whale season.`;
+  }
+
+  if (seasonType === 'reduced') {
+    if (reason) return `${lead} with ${reason} and reduced seasonal activity.`;
+    return `${lead} with reduced seasonal activity.`;
+  }
+
+  if (reason) {
+    return `${lead} with ${reason}.`;
+  }
+
+  if (seasonType === 'active' && level >= 2) {
+    return `${lead} during active whale season.`;
+  }
+
+  return `${lead}.`;
+}
+
+function formatTimeWindowWhaleWatchingSentence(level, monthIndex, windowText) {
+  const labels = ['Poor', 'Fair', 'Good', 'Excellent'];
+  const seasonType = getWhaleSeasonType(monthIndex);
+  const lead = `${labels[level]} whale watching conditions ${windowText}`;
+
+  if (seasonType === 'peak') {
+    if (level === 3) return `${lead} during peak whale season.`;
+    return `${lead} with strong seasonal activity.`;
+  }
+
+  if (seasonType === 'reduced') {
+    return `${lead} with reduced seasonal activity.`;
+  }
+
+  return `${lead}.`;
 }
 
 function getTideTurningPoints(entries) {
