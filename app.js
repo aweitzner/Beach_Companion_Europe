@@ -1,4 +1,4 @@
-const APP_VERSION = 'v0.1.5';
+const APP_VERSION = 'v0.1.6';
 const UNIT_SYSTEMS = Object.freeze({
   metric: 'metric',
   imperial: 'imperial'
@@ -471,6 +471,7 @@ function buildNotes(dayHours, daytimeHours, dayKey) {
   const maxWave = getMaxWave(dayHours);
   const seaWindow = getCalmSeaWindow(daytimeHours);
   const whaleWatchingNote = buildWhaleWatchingNote(dayHours, daytimeHours, dayKey);
+  const ferrariaNote = buildFerrariaNote(dayHours, daytimeHours, dayKey);
 
   if (maxPrecip && maxPrecip.precipitationProbability >= 60) {
     notes.push({ priority: 1, text: `Rain most likely around ${formatHour(maxPrecip.time)}.` });
@@ -496,6 +497,10 @@ function buildNotes(dayHours, daytimeHours, dayKey) {
 
   if (whaleWatchingNote) {
     notes.push({ priority: 3, text: whaleWatchingNote });
+  }
+
+  if (ferrariaNote) {
+    notes.push({ priority: 3, text: ferrariaNote });
   }
 
   if (!notes.length) {
@@ -541,6 +546,35 @@ function getCalmSeaWindow(entries) {
   return getNearestHour(calmCandidates, 9);
 }
 
+function buildFerrariaNote(dayHours, daytimeHours, dayKey) {
+  const lowTidePoint = getPreferredFerrariaLowTide(dayHours, dayKey);
+  if (!lowTidePoint) return null;
+
+  const baseWindow = getFerrariaBaseWindow(lowTidePoint);
+  const adjustedWindow = adjustFerrariaWindow(baseWindow, daytimeHours, lowTidePoint);
+  const windowEntries = getEntriesInHourWindow(dayHours, adjustedWindow.startHour, adjustedWindow.endHour);
+  if (!windowEntries.length) return null;
+
+  const level = evaluateFerrariaCondition(windowEntries);
+  const labels = ['Poor', 'Fair', 'Good', 'Excellent'];
+  const lowTideText = formatHour(lowTidePoint.time);
+  const windowText = formatHourRange(adjustedWindow.startHour, adjustedWindow.endHour);
+
+  if (level === 0) {
+    return 'Poor Ferraria conditions due to rough Atlantic surge.';
+  }
+
+  if (level === 1) {
+    return `Fair Ferraria conditions despite favorable ${lowTideText.toLowerCase()} low tide timing.`;
+  }
+
+  if (adjustedWindow.isNarrow) {
+    return `${labels[level]} Ferraria conditions near the ${lowTideText.toLowerCase()} low tide.`;
+  }
+
+  return `${labels[level]} Ferraria conditions from ${windowText} near low tide.`;
+}
+
 function getWhaleWatchingHours(dayHours, daytimeHours, dayKey) {
   const morningHours = dayHours.filter(entry => entry.hour >= 6 && entry.hour < 13);
   if (dayKey !== getCurrentDateKey() && morningHours.length) {
@@ -561,6 +595,131 @@ function getWhaleWatchingHours(dayHours, daytimeHours, dayKey) {
   }
 
   return morningHours.length ? morningHours : daytimeHours;
+}
+
+function getPreferredFerrariaLowTide(dayHours, dayKey) {
+  const lowTides = getTideTurningPoints(dayHours)
+    .filter(point => point.type === 'L')
+    .filter(point => {
+      const hour = getHourFromIso(point.time);
+      return hour >= 6 && hour <= 18;
+    });
+
+  if (!lowTides.length) {
+    return getTideTurningPoints(dayHours).find(point => point.type === 'L') || null;
+  }
+
+  if (dayKey === getCurrentDateKey()) {
+    const nowHour = getCurrentHourFraction();
+    const upcoming = lowTides.find(point => getHourFromIso(point.time) + 1 >= nowHour);
+    if (upcoming) return upcoming;
+  }
+
+  return getNearestPointToHour(lowTides, 11) || lowTides[0];
+}
+
+function getNearestPointToHour(points, targetHour) {
+  return points.reduce((closest, point) => {
+    if (!closest) return point;
+    const pointHour = getHourFromIso(point.time);
+    const closestHour = getHourFromIso(closest.time);
+    return Math.abs(pointHour - targetHour) < Math.abs(closestHour - targetHour) ? point : closest;
+  }, null);
+}
+
+function getFerrariaBaseWindow(lowTidePoint) {
+  const lowHour = getHourFromIso(lowTidePoint.time);
+  return {
+    lowHour,
+    startHour: Math.max(6, lowHour - 2),
+    endHour: Math.min(18, lowHour + 1)
+  };
+}
+
+function adjustFerrariaWindow(baseWindow, daytimeHours, lowTidePoint) {
+  const postLowEntries = daytimeHours.filter(entry => entry.hour > baseWindow.lowHour && entry.hour <= baseWindow.lowHour + 2);
+  const preLowEntries = daytimeHours.filter(entry => entry.hour >= baseWindow.startHour && entry.hour <= baseWindow.lowHour);
+  const lowTideEntry = daytimeHours.find(entry => entry.hour === baseWindow.lowHour) || null;
+  let startHour = baseWindow.startHour;
+  let endHour = baseWindow.endHour;
+
+  const worseningWind = getFirstEntryMatching(postLowEntries, entry => toDisplayWindSpeed(entry.windSpeed) >= 17);
+  const worseningSwell = getFirstEntryMatching(postLowEntries, entry => {
+    if (!Number.isFinite(entry.waveHeight)) return false;
+    const baseline = Number.isFinite(lowTideEntry?.waveHeight)
+      ? lowTideEntry.waveHeight
+      : getMaxBy(preLowEntries, 'waveHeight')?.waveHeight;
+    return Number.isFinite(baseline) && entry.waveHeight >= baseline + 0.5;
+  });
+
+  if (worseningWind || worseningSwell) {
+    endHour = Math.max(baseWindow.lowHour, Math.min(
+      endHour,
+      (worseningWind ? worseningWind.hour : Infinity),
+      (worseningSwell ? worseningSwell.hour : Infinity)
+    ) - 1);
+  }
+
+  const earlyWindWorsening = getFirstEntryMatching(preLowEntries, entry =>
+    entry.hour >= baseWindow.lowHour - 1 && toDisplayWindSpeed(entry.windSpeed) >= 17
+  );
+  if (earlyWindWorsening) {
+    endHour = Math.min(endHour, baseWindow.lowHour);
+  }
+
+  const improvingAfterLowTide = postLowEntries.length
+    && postLowEntries.every(entry =>
+      (!Number.isFinite(entry.waveHeight) || !Number.isFinite(lowTideEntry?.waveHeight) || entry.waveHeight <= lowTideEntry.waveHeight)
+      && toDisplayWindSpeed(entry.windSpeed) < 17
+    );
+
+  if (improvingAfterLowTide) {
+    endHour = Math.min(18, Math.max(endHour, baseWindow.lowHour + 2));
+  }
+
+  if (toDisplayWindSpeed(getPeakWind(preLowEntries)?.windSpeed) >= 22) {
+    startHour = Math.max(6, startHour - 1);
+    endHour = Math.min(endHour, baseWindow.lowHour);
+  }
+
+  return {
+    startHour,
+    endHour,
+    isNarrow: endHour - startHour <= 1
+  };
+}
+
+function getFirstEntryMatching(entries, predicate) {
+  return entries.find(entry => {
+    try {
+      return predicate(entry);
+    } catch (error) {
+      return false;
+    }
+  }) || null;
+}
+
+function getEntriesInHourWindow(entries, startHour, endHour) {
+  return entries.filter(entry => entry.hour >= startHour && entry.hour <= endHour);
+}
+
+function evaluateFerrariaCondition(entries) {
+  const maxWave = getMaxBy(entries.filter(entry => Number.isFinite(entry.waveHeight)), 'waveHeight')?.waveHeight;
+  const peakWindMph = toDisplayWindSpeed(getPeakWind(entries)?.windSpeed);
+
+  if (Number.isFinite(maxWave)) {
+    if (maxWave > 4) return 0;
+    if (maxWave > 2.5) return 1;
+    if (maxWave >= 1.5) return 2;
+  }
+
+  if (Number.isFinite(peakWindMph)) {
+    if (peakWindMph > 22) return 0;
+    if (peakWindMph >= 17) return 1;
+    if (peakWindMph >= 10) return 2;
+  }
+
+  return 3;
 }
 
 function getWhaleSeasonType(monthIndex) {
@@ -1227,6 +1386,10 @@ function formatLongDate(dayKey) {
 
 function formatHour(isoText) {
   return formatCompactHour(getHourFromIso(isoText));
+}
+
+function formatHourRange(startHour, endHour) {
+  return `${formatCompactHour(startHour)}–${formatCompactHour(endHour)}`;
 }
 
 function formatCompactHour(hour24) {
